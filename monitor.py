@@ -6,8 +6,8 @@ import re
 from datetime import datetime, timedelta
 
 # ===== APNA DATA DAAL =====
-BOT_TOKEN  = "APNA_BOT_TOKEN"
-CHAT_ID    = "APNA_CHAT_ID"
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+CHAT_ID    = os.environ.get("CHAT_ID", "")
 INTERVAL   = 900
 SAVE_FILE  = "seen.json"
 # ==========================
