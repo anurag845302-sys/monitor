@@ -71,27 +71,24 @@ GITHUB_SEARCH  = ["tailshaofu apk", "tailpay payment", "diwapay release"]
 
 def send(msg):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+        token = os.environ.get("BOT_TOKEN", "")
+        chat  = os.environ.get("CHAT_ID", "")
+        
+        # Debug — log mein print karo
+        print(f"[SEND] token length: {len(token)}, chat_id: {chat}")
+        
+        if not token or not chat:
+            print("[SEND ERROR] BOT_TOKEN ya CHAT_ID empty hai!")
+            return
+            
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": msg, "parse_mode": "HTML"},
             timeout=10
         )
+        print(f"[SEND] Response: {r.status_code} — {r.text[:100]}")
     except Exception as e:
-        print(f"[Telegram Error] {e}")
-
-def load_seen():
-    if os.path.exists(SAVE_FILE):
-        with open(SAVE_FILE) as f:
-            return json.load(f)
-    # Structure: {"seen_keys": [], "app_versions": {}}
-    return {"seen_keys": [], "app_versions": {}}
-
-def save_seen(data):
-    with open(SAVE_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+        print(f"[SEND ERROR] {e}")
 
 # ============================================================
 # MODULE 1 — CLOUDFRONT VERSION TRACKER
