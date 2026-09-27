@@ -6,8 +6,8 @@ import re
 from datetime import datetime, timedelta
 
 # ===================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("CHAT_ID", "")
+BOT_TOKEN = os.environ.get("8995079631:AAF0ZHCPvRS2dKoLjfZWi0euahYPc7mrKnI", "")
+CHAT_ID   = os.environ.get(" 8934747857", "")
 INTERVAL  = 900
 SAVE_FILE = "seen.json"
 CF_BASE   = "https://d6d2sg7as7xll.cloudfront.net"
