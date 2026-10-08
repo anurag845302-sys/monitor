@@ -6,8 +6,8 @@ import re
 from datetime import datetime, timedelta
 
 # ===================================================
-BOT_TOKEN = os.environ.get("8995079631:AAF0ZHCPvRS2dKoLjfZWi0euahYPc7mrKnI", "")
-CHAT_ID   = os.environ.get(" 8934747857", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID   = os.environ.get("CHAT_ID", "")
 INTERVAL  = 900
 SAVE_FILE = "seen.json"
 CF_BASE   = "https://d6d2sg7as7xll.cloudfront.net"
@@ -49,16 +49,30 @@ CRT_KEYWORDS = [
     "jpgpay","okpay","comeapp","wynnpay"
 ]
 
-GITHUB_USERS  = ["tailshaofu005-cmd","tailpaytech"]
-GITHUB_SEARCH = ["tailshaofu apk","tailpay payment","diwapay release"]
+# 4 naye accounts add kiye
+GITHUB_USERS = [
+    "tailshaofu005-cmd",
+    "tailpaytech",
+    "649152551",
+    "jqkxcdgpkh",
+    "286375632",
+    "boxcking"
+]
+
+GITHUB_SEARCH = [
+    "tailshaofu apk",
+    "tailpay payment",
+    "diwapay release",
+    "jpgpay apk",
+    "qqpay payment app"
+]
 
 # ===================================================
 # UTILITIES
 # ===================================================
 
 def send(msg):
-    """Telegram pe message bhejo"""
-    print(f"[SEND] Attempting... chat={CHAT_ID[:6]}...")
+    print(f"[SEND] token={BOT_TOKEN[:8]}... chat={CHAT_ID}")
     try:
         if not BOT_TOKEN or not CHAT_ID:
             print("[SEND ERROR] BOT_TOKEN ya CHAT_ID missing!")
@@ -73,20 +87,18 @@ def send(msg):
             timeout=15
         )
         if r.status_code == 200:
-            print(f"[SEND] OK — message_id: {r.json().get('result',{}).get('message_id')}")
+            print(f"[SEND OK] msg_id={r.json().get('result',{}).get('message_id')}")
         else:
-            print(f"[SEND ERROR] {r.status_code}: {r.text[:150]}")
+            print(f"[SEND FAIL] {r.status_code}: {r.text[:150]}")
     except Exception as e:
-        print(f"[SEND EXCEPTION] {e}")
+        print(f"[SEND ERR] {e}")
 
 def load_data():
     if os.path.exists(SAVE_FILE):
         with open(SAVE_FILE) as f:
             d = json.load(f)
-            if "seen_keys" not in d:
-                d["seen_keys"] = []
-            if "app_versions" not in d:
-                d["app_versions"] = {}
+            if "seen_keys"    not in d: d["seen_keys"]    = []
+            if "app_versions" not in d: d["app_versions"] = {}
             return d
     return {"seen_keys": [], "app_versions": {}}
 
@@ -117,7 +129,6 @@ def check_cloudfront(data):
     seen     = set(data["seen_keys"])
     versions = data["app_versions"]
 
-    # Known apps — version update check
     for domain, (app, base_ver) in APP_MAP.items():
         cur = versions.get(app, base_ver)
         for ver in range(cur, cur + 15):
@@ -136,7 +147,7 @@ def check_cloudfront(data):
                         "domain":domain,"old":old,"new":ver,
                         "url":url,"mb":mb
                     })
-                    log(f"  [UPDATE] {app} v{old}→v{ver}")
+                    log(f"  [UPDATE] {app} v{old}->v{ver}")
                 else:
                     versions[app] = ver
                     findings.append({
@@ -145,13 +156,12 @@ def check_cloudfront(data):
                     })
             time.sleep(0.2)
 
-    # New unknown apps scan
     extra = [
         "star","gold","win","top","ace","pro","max",
         "flash","super","mega","tiger","lion","eagle",
         "wolf","king","cash","coin","rupee","gpay",
         "epay","xpay","zpay","pay2","pay3","wallet",
-        "swift","speed","quick","rapid","turbo"
+        "swift","speed","quick","rapid","turbo","lite","go"
     ]
     known = {v[0] for v in APP_MAP.values()}
     for app in extra:
@@ -164,7 +174,7 @@ def check_cloudfront(data):
             url, size = cf_check(app, ver)
             if url:
                 seen.add(key)
-                mb = round(size/1024/1024,1) if size else 0
+                mb = round(size/1024/1024, 1) if size else 0
                 versions[app] = ver
                 findings.append({
                     "type":"cf_new","app":app.upper(),
@@ -194,7 +204,7 @@ def check_domains(data):
                 timeout=10,
                 allow_redirects=True
             )
-            if r.status_code not in [200,201]:
+            if r.status_code not in [200, 201]:
                 continue
             apk_links = re.findall(r'https?://[^\s"\'<>]+\.apk', r.text)
             for link in apk_links:
@@ -232,15 +242,15 @@ def check_ssl(data):
             if r.status_code != 200:
                 continue
             for cert in r.json():
-                domain = cert.get('name_value','').strip()
-                date_s = cert.get('not_before','')
+                domain = cert.get('name_value', '').strip()
+                date_s = cert.get('not_before', '')
                 if not domain or domain.startswith('*'):
                     continue
                 key = f"ssl:{domain}"
                 if key in seen:
                     continue
                 try:
-                    d = datetime.strptime(date_s[:10],'%Y-%m-%d')
+                    d = datetime.strptime(date_s[:10], '%Y-%m-%d')
                     if d >= since:
                         seen.add(key)
                         findings.append({
@@ -258,7 +268,7 @@ def check_ssl(data):
     return findings
 
 # ===================================================
-# MODULE 4 — GITHUB
+# MODULE 4 — GITHUB (6 accounts + search)
 # ===================================================
 
 def check_github(data):
@@ -277,18 +287,54 @@ def check_github(data):
                 headers=hdrs, timeout=12
             )
             if r.status_code == 200:
-                for repo in r.json():
+                repos = r.json()
+                log(f"  [GH] {user}: {len(repos)} repos")
+                for repo in repos:
                     key = f"gh:{repo['full_name']}"
                     if key in seen:
                         continue
                     seen.add(key)
                     findings.append({
-                        "type":"github",
-                        "name":repo['full_name'],
-                        "url":repo['html_url'],
-                        "date":repo.get('updated_at','')[:10]
+                        "type":   "github",
+                        "name":   repo['full_name'],
+                        "url":    repo['html_url'],
+                        "date":   repo.get('updated_at','')[:10],
+                        "user":   user
                     })
-                    log(f"  [GH] {repo['full_name']}")
+
+                    # Releases bhi check karo
+                    try:
+                        rel = requests.get(
+                            f"https://api.github.com/repos/{repo['full_name']}/releases?per_page=5",
+                            headers=hdrs, timeout=10
+                        )
+                        if rel.status_code == 200:
+                            for release in rel.json():
+                                rkey = f"ghrel:{repo['full_name']}:{release['tag_name']}"
+                                if rkey in seen:
+                                    continue
+                                seen.add(rkey)
+                                # APK asset dhundho
+                                for asset in release.get('assets', []):
+                                    if asset['name'].endswith('.apk'):
+                                        findings.append({
+                                            "type":    "github_release",
+                                            "repo":    repo['full_name'],
+                                            "tag":     release['tag_name'],
+                                            "apk":     asset['browser_download_url'],
+                                            "size_mb": round(asset['size']/1024/1024, 1),
+                                            "date":    release.get('published_at','')[:10],
+                                            "user":    user
+                                        })
+                                        log(f"  [GH RELEASE] {repo['full_name']} {release['tag_name']}")
+                    except:
+                        pass
+                    time.sleep(0.3)
+
+            elif r.status_code == 404:
+                log(f"  [GH] {user}: not found")
+            else:
+                log(f"  [GH] {user}: {r.status_code}")
         except Exception as e:
             log(f"  GitHub err ({user}): {e}")
         time.sleep(1)
@@ -301,16 +347,17 @@ def check_github(data):
                 headers=hdrs, timeout=12
             )
             if r.status_code == 200:
-                for item in r.json().get('items',[]):
+                for item in r.json().get('items', []):
                     key = f"ghs:{item['full_name']}"
                     if key in seen:
                         continue
                     seen.add(key)
                     findings.append({
-                        "type":"github",
-                        "name":item['full_name'],
-                        "url":item['html_url'],
-                        "date":item.get('updated_at','')[:10]
+                        "type": "github",
+                        "name": item['full_name'],
+                        "url":  item['html_url'],
+                        "date": item.get('updated_at','')[:10],
+                        "user": "search"
                     })
         except Exception as e:
             log(f"  GH search err: {e}")
@@ -324,7 +371,7 @@ def check_github(data):
 # ===================================================
 
 def alert(f):
-    t = f['type']
+    t  = f['type']
     ts = datetime.now().strftime('%d %b %H:%M')
 
     if t == "cf_update":
@@ -338,7 +385,7 @@ def alert(f):
         )
     elif t == "cf_new":
         return (
-            f"🆕 <b>NAYA APP MILA!</b>\n"
+            f"🆕 <b>NAYA APP CLOUDFRONT PE!</b>\n"
             f"📱 <b>{f['app']}</b> v{f['ver']}\n"
             f"🔗 <code>{f['url']}</code>\n"
             f"💾 {f['mb']} MB | ⏰ {ts}"
@@ -354,11 +401,12 @@ def alert(f):
         return (
             f"🌐 <b>DOMAIN APK!</b>\n"
             f"📱 <b>{f['app']}</b>\n"
+            f"🌐 {f['domain']}\n"
             f"🔗 <code>{f['url']}</code>"
         )
     elif t == "ssl":
         return (
-            f"🔐 <b>NAYA DOMAIN!</b>\n"
+            f"🔐 <b>NAYA DOMAIN/SSL!</b>\n"
             f"🌐 <code>{f['domain']}</code>\n"
             f"📅 {f['date']} | 🔍 {f['kw']}\n"
             f"➡️ https://{f['domain']}"
@@ -366,9 +414,19 @@ def alert(f):
     elif t == "github":
         return (
             f"🐙 <b>GITHUB REPO!</b>\n"
-            f"📁 <b>{f['name']}</b>\n"
+            f"👤 Account: <b>{f['user']}</b>\n"
+            f"📁 {f['name']}\n"
             f"🔗 {f['url']}\n"
             f"📅 {f['date']}"
+        )
+    elif t == "github_release":
+        return (
+            f"🚀 <b>GITHUB RELEASE / NEW APK!</b>\n"
+            f"👤 Account: <b>{f['user']}</b>\n"
+            f"📁 {f['repo']}\n"
+            f"🏷️ Tag: <b>{f['tag']}</b>\n"
+            f"🔗 <code>{f['apk']}</code>\n"
+            f"💾 {f['size_mb']} MB | 📅 {f['date']}"
         )
     return str(f)
 
@@ -389,20 +447,29 @@ def run(data):
     return all_f
 
 def main():
-    log("="*40)
-    log("TailPay Monitor v3 START")
-    log(f"BOT_TOKEN set: {bool(BOT_TOKEN)}")
-    log(f"CHAT_ID set:   {bool(CHAT_ID)}")
-    log("="*40)
+    log("=" * 40)
+    log("TailPay Monitor v4 START")
+    log(f"BOT_TOKEN: {'SET (' + str(len(BOT_TOKEN)) + ' chars)' if BOT_TOKEN else 'MISSING!'}")
+    log(f"CHAT_ID:   {'SET' if CHAT_ID else 'MISSING!'}")
+    log(f"GitHub accounts: {len(GITHUB_USERS)}")
+    log("=" * 40)
 
-    # Startup test message
-    send("🟢 <b>TailPay Monitor v3 ON</b>\n\n"
-         f"📱 {len(APP_MAP)} apps track ho rahe hain\n"
-         "🔄 CloudFront version updates\n"
-         "🆕 Naye apps detect\n"
-         "🔐 SSL certificates\n"
-         "🐙 GitHub repos\n\n"
-         f"⏰ Har {INTERVAL//60} min check hoga!")
+    send(
+        "🟢 <b>TailPay Monitor v4 ON</b>\n\n"
+        f"📱 {len(APP_MAP)} apps track ho rahe hain\n"
+        "🔄 CloudFront version updates\n"
+        "🆕 Naye CloudFront apps\n"
+        "🔐 SSL certificates\n"
+        f"🐙 GitHub: {len(GITHUB_USERS)} accounts monitor\n"
+        "  ├ tailshaofu005-cmd\n"
+        "  ├ tailpaytech\n"
+        "  ├ 649152551\n"
+        "  ├ jqkxcdgpkh\n"
+        "  ├ 286375632\n"
+        "  └ boxcking\n\n"
+        f"⏰ Har {INTERVAL//60} min check hoga!\n"
+        "Koi bhi release/update — seedha alert!"
+    )
 
     data = load_data()
 
@@ -410,17 +477,36 @@ def main():
     findings = run(data)
     save_data(data)
 
-    if findings:
-        send(f"📋 <b>Pehle scan mein {len(findings)} cheezein mili!</b>")
-        for f in findings:
+    cf_found  = [f for f in findings if f['type'] == 'cf_found']
+    updates   = [f for f in findings if f['type'] == 'cf_update']
+    new_apps  = [f for f in findings if f['type'] == 'cf_new']
+    gh_repos  = [f for f in findings if f['type'] == 'github']
+    gh_rel    = [f for f in findings if f['type'] == 'github_release']
+    ssl_certs = [f for f in findings if f['type'] == 'ssl']
+
+    summary = (
+        f"📊 <b>Pehla scan complete!</b>\n\n"
+        f"📦 Existing APKs confirmed: {len(cf_found)}\n"
+        f"🔄 Version updates: {len(updates)}\n"
+        f"🆕 Naye apps: {len(new_apps)}\n"
+        f"🐙 GitHub repos: {len(gh_repos)}\n"
+        f"🚀 GitHub releases: {len(gh_rel)}\n"
+        f"🔐 SSL certs: {len(ssl_certs)}\n\n"
+        f"Ab monitoring shuru — alert aayega jab kuch naya mile!"
+    )
+    send(summary)
+
+    # Sirf important alerts bhejo — cf_found skip karo (bahut zyada hogi)
+    important = [f for f in findings if f['type'] in
+                 ['cf_update','cf_new','github','github_release','ssl','domain_apk']]
+    if important:
+        send(f"⚡ <b>{len(important)} important findings:</b>")
+        for f in important:
             send(alert(f))
             time.sleep(0.5)
-    else:
-        log("Pehla scan complete — kuch naya nahi mila")
-        send("✅ Pehla scan complete!\nKoi naya app nahi mila abhi.\nAb monitoring shuru — alert aayega jab kuch mile!")
 
     while True:
-        log(f"Next check in {INTERVAL//60} min...")
+        log(f"Next check {INTERVAL//60} min mein...")
         time.sleep(INTERVAL)
         log("Checking all sources...")
         findings = run(data)
@@ -428,10 +514,10 @@ def main():
         if findings:
             for f in findings:
                 send(alert(f))
-                log(f"Sent: {f['type']}")
+                log(f"Alert sent: {f['type']}")
                 time.sleep(0.5)
         else:
-            log("Kuch naya nahi")
+            log("Kuch naya nahi mila")
 
 if __name__ == "__main__":
     try:
