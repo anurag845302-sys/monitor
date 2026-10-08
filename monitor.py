@@ -3,13 +3,15 @@ import time
 import json
 import os
 import re
-from datetime import datetime, timedelta
+import hashlib
+from datetime import datetime, timezone, timedelta
 
 # ===================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("CHAT_ID", "")
+GH_TOKEN  = os.environ.get("GH_TOKEN", "")  # optional GitHub token
 INTERVAL  = 900
-SAVE_FILE = "seen.json"
+SAVE_FILE = os.environ.get("SAVE_FILE", "/data/seen.json")
 CF_BASE   = "https://d6d2sg7as7xll.cloudfront.net"
 # ===================================================
 
@@ -49,7 +51,6 @@ CRT_KEYWORDS = [
     "jpgpay","okpay","comeapp","wynnpay"
 ]
 
-# 4 naye accounts add kiye
 GITHUB_USERS = [
     "tailshaofu005-cmd",
     "tailpaytech",
@@ -67,125 +68,179 @@ GITHUB_SEARCH = [
     "qqpay payment app"
 ]
 
+SEEN_LIMIT = 10000  # max keys to keep
+
 # ===================================================
 # UTILITIES
 # ===================================================
 
+def log(msg):
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}", flush=True)
+
 def send(msg):
-    print(f"[SEND] token={BOT_TOKEN[:8]}... chat={CHAT_ID}")
+    if not BOT_TOKEN or not CHAT_ID:
+        log("[SEND] TOKEN or CHAT missing")
+        return
     try:
-        if not BOT_TOKEN or not CHAT_ID:
-            print("[SEND ERROR] BOT_TOKEN ya CHAT_ID missing!")
-            return
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id":    CHAT_ID,
-                "text":       msg,
-                "parse_mode": "HTML"
-            },
+            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
             timeout=15
         )
-        if r.status_code == 200:
-            print(f"[SEND OK] msg_id={r.json().get('result',{}).get('message_id')}")
-        else:
-            print(f"[SEND FAIL] {r.status_code}: {r.text[:150]}")
+        if r.status_code != 200:
+            log(f"[SEND FAIL] {r.status_code}")
     except Exception as e:
-        print(f"[SEND ERR] {e}")
+        log(f"[SEND ERR] {e}")
 
 def load_data():
+    default = {
+        "seen_keys": [],
+        "app_versions": {},
+        "app_hashes": {},
+        "github_repos": {},
+        "github_releases": {},
+        "last_scan": None,
+        "first_run_done": False,
+    }
     if os.path.exists(SAVE_FILE):
-        with open(SAVE_FILE) as f:
-            d = json.load(f)
-            if "seen_keys"    not in d: d["seen_keys"]    = []
-            if "app_versions" not in d: d["app_versions"] = {}
-            return d
-    return {"seen_keys": [], "app_versions": {}}
+        try:
+            with open(SAVE_FILE) as f:
+                d = json.load(f)
+                for k, v in default.items():
+                    if k not in d:
+                        d[k] = v
+                return d
+        except Exception as e:
+            log(f"load_data err: {e}")
+    return default
 
 def save_data(d):
-    with open(SAVE_FILE, 'w') as f:
-        json.dump(d, f, indent=2)
-
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-
-# ===================================================
-# MODULE 1 — CLOUDFRONT TRACKER
-# ===================================================
-
-def cf_check(app, ver):
-    url = f"{CF_BASE}/{app}/{app}{ver}/app.apk"
     try:
-        r = requests.head(url, headers=HEADERS, timeout=8)
-        if r.status_code == 200:
-            size = int(r.headers.get('Content-Length', 0))
-            return url, size
-    except:
+        os.makedirs(os.path.dirname(SAVE_FILE), exist_ok=True)
+    except Exception:
         pass
-    return None, None
+    tmp = SAVE_FILE + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(d, f)
+    os.replace(tmp, SAVE_FILE)
+
+def prune_seen(seen_list):
+    if len(seen_list) > SEEN_LIMIT:
+        return seen_list[-SEEN_LIMIT:]
+    return seen_list
+
+def human_size(b):
+    if not b: return "?"
+    return f"{round(b/1024/1024, 2)} MB"
+
+def now_str():
+    return datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
+
+# ===================================================
+# MODULE 1 — CLOUDFRONT TRACKER (detailed)
+# ===================================================
+
+def cf_head(url):
+    """HEAD request — returns (status, size, last_modified)"""
+    try:
+        r = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
+        size = int(r.headers.get('Content-Length', 0))
+        lm = r.headers.get('Last-Modified', '')
+        etag = r.headers.get('ETag', '').strip('"')
+        return r.status_code, size, lm, etag
+    except Exception:
+        return 0, 0, '', ''
+
+def cf_hash(url):
+    """Download APK to compute SHA256 — only if changed. Limit 20MB."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30, stream=True)
+        if r.status_code != 200:
+            return None
+        h = hashlib.sha256()
+        total = 0
+        for chunk in r.iter_content(65536):
+            h.update(chunk)
+            total += len(chunk)
+            if total > 25 * 1024 * 1024:
+                break
+        return h.hexdigest()[:16]
+    except Exception:
+        return None
 
 def check_cloudfront(data):
     findings = []
-    seen     = set(data["seen_keys"])
+    seen = set(data["seen_keys"])
     versions = data["app_versions"]
+    hashes = data["app_hashes"]
 
     for domain, (app, base_ver) in APP_MAP.items():
         cur = versions.get(app, base_ver)
-        for ver in range(cur, cur + 15):
+        # check cur and up to +10 versions
+        for ver in range(cur, cur + 11):
+            url = f"{CF_BASE}/{app}/{app}{ver}/app.apk"
             key = f"cf:{app}{ver}"
-            if key in seen:
-                continue
-            url, size = cf_check(app, ver)
-            if url:
-                seen.add(key)
-                mb = round(size/1024/1024, 1) if size else 0
+
+            status, size, lm, etag = cf_head(url)
+            if status == 200:
                 if ver > cur:
-                    old = versions.get(app, base_ver)
+                    # version update
+                    old_ver = cur
                     versions[app] = ver
-                    findings.append({
-                        "type":"cf_update","app":app.upper(),
-                        "domain":domain,"old":old,"new":ver,
-                        "url":url,"mb":mb
-                    })
-                    log(f"  [UPDATE] {app} v{old}->v{ver}")
+                    old_hash = hashes.get(app, {}).get("hash")
+                    new_hash = etag or None
+                    hashes[app] = {"ver": ver, "hash": new_hash, "size": size, "lm": lm}
+                    if key not in seen:
+                        seen.add(key)
+                        findings.append({
+                            "type": "cf_update",
+                            "app": app.upper(),
+                            "domain": domain,
+                            "old_ver": old_ver,
+                            "new_ver": ver,
+                            "url": url,
+                            "size": size,
+                            "lm": lm,
+                            "old_hash": old_hash,
+                            "new_hash": new_hash,
+                        })
                 else:
-                    versions[app] = ver
-                    findings.append({
-                        "type":"cf_found","app":app.upper(),
-                        "ver":ver,"url":url,"mb":mb
-                    })
-            time.sleep(0.2)
-
-    extra = [
-        "star","gold","win","top","ace","pro","max",
-        "flash","super","mega","tiger","lion","eagle",
-        "wolf","king","cash","coin","rupee","gpay",
-        "epay","xpay","zpay","pay2","pay3","wallet",
-        "swift","speed","quick","rapid","turbo","lite","go"
-    ]
-    known = {v[0] for v in APP_MAP.values()}
-    for app in extra:
-        if app in known or app in versions:
-            continue
-        for ver in range(100, 115):
-            key = f"cf:{app}{ver}"
-            if key in seen:
-                break
-            url, size = cf_check(app, ver)
-            if url:
-                seen.add(key)
-                mb = round(size/1024/1024, 1) if size else 0
+                    # same version, check if size or etag changed
+                    prev = hashes.get(app, {})
+                    prev_size = prev.get("size")
+                    prev_hash = prev.get("hash")
+                    changed = False
+                    reasons = []
+                    if prev_size and size and prev_size != size:
+                        changed = True
+                        reasons.append(f"size {human_size(prev_size)} → {human_size(size)}")
+                    if prev_hash and etag and prev_hash != etag:
+                        changed = True
+                        reasons.append(f"hash {prev_hash[:8]} → {etag[:8]}")
+                    hashes[app] = {"ver": ver, "hash": etag, "size": size, "lm": lm}
+                    if changed and key not in seen:
+                        seen.add(key)
+                        findings.append({
+                            "type": "cf_rehash",
+                            "app": app.upper(),
+                            "domain": domain,
+                            "ver": ver,
+                            "url": url,
+                            "size": size,
+                            "lm": lm,
+                            "reasons": reasons,
+                        })
+                    elif key not in seen:
+                        # first time — record baseline, don't spam
+                        seen.add(key)
                 versions[app] = ver
-                findings.append({
-                    "type":"cf_new","app":app.upper(),
-                    "ver":ver,"url":url,"mb":mb
-                })
-                log(f"  [NEW APP] {app} v{ver}")
                 break
-        time.sleep(0.15)
+            time.sleep(0.15)
 
-    data["seen_keys"]    = list(seen)
+    data["seen_keys"] = prune_seen(list(seen))
     data["app_versions"] = versions
+    data["app_hashes"] = hashes
     return findings
 
 # ===================================================
@@ -194,16 +249,12 @@ def check_cloudfront(data):
 
 def check_domains(data):
     findings = []
-    seen     = set(data["seen_keys"])
+    seen = set(data["seen_keys"])
 
     for domain, (app, _) in APP_MAP.items():
         try:
-            r = requests.get(
-                f"https://{domain}",
-                headers=HEADERS,
-                timeout=10,
-                allow_redirects=True
-            )
+            r = requests.get(f"https://{domain}", headers=HEADERS, timeout=10,
+                             allow_redirects=True)
             if r.status_code not in [200, 201]:
                 continue
             apk_links = re.findall(r'https?://[^\s"\'<>]+\.apk', r.text)
@@ -213,222 +264,279 @@ def check_domains(data):
                     continue
                 seen.add(key)
                 findings.append({
-                    "type":"domain_apk","app":app.upper(),
-                    "domain":domain,"url":link
+                    "type": "domain_apk",
+                    "app": app.upper(),
+                    "domain": domain,
+                    "url": link,
                 })
-                log(f"  [DOM APK] {domain}")
-        except:
+        except Exception:
             pass
         time.sleep(0.3)
 
-    data["seen_keys"] = list(seen)
+    data["seen_keys"] = prune_seen(list(seen))
     return findings
 
 # ===================================================
-# MODULE 3 — SSL CERTIFICATE
+# MODULE 3 — SSL CERT
 # ===================================================
 
 def check_ssl(data):
     findings = []
-    seen     = set(data["seen_keys"])
-    since    = datetime.now() - timedelta(hours=24)
+    seen = set(data["seen_keys"])
+    since = datetime.now() - timedelta(days=3)
 
     for kw in CRT_KEYWORDS:
         try:
-            r = requests.get(
-                f"https://crt.sh/?q=%25{kw}%25&output=json",
-                timeout=20
-            )
+            r = requests.get(f"https://crt.sh/?q=%25{kw}%25&output=json", timeout=25)
             if r.status_code != 200:
                 continue
-            for cert in r.json():
-                domain = cert.get('name_value', '').strip()
-                date_s = cert.get('not_before', '')
+            certs = r.json()
+            for cert in certs:
+                domain = cert.get('name_value', '').strip().split('\n')[0]
+                date_s = cert.get('not_before', '')[:10]
                 if not domain or domain.startswith('*'):
                     continue
                 key = f"ssl:{domain}"
                 if key in seen:
                     continue
                 try:
-                    d = datetime.strptime(date_s[:10], '%Y-%m-%d')
+                    d = datetime.strptime(date_s, '%Y-%m-%d')
                     if d >= since:
                         seen.add(key)
                         findings.append({
-                            "type":"ssl","domain":domain,
-                            "date":date_s[:10],"kw":kw
+                            "type": "ssl",
+                            "domain": domain,
+                            "date": date_s,
+                            "kw": kw,
                         })
-                        log(f"  [SSL] {domain}")
-                except:
+                except Exception:
                     pass
         except Exception as e:
-            log(f"  crt.sh err ({kw}): {e}")
+            log(f"crt err {kw}: {e}")
         time.sleep(1)
 
-    data["seen_keys"] = list(seen)
+    data["seen_keys"] = prune_seen(list(seen))
     return findings
 
 # ===================================================
-# MODULE 4 — GITHUB (6 accounts + search)
+# MODULE 4 — GITHUB
 # ===================================================
+
+def gh_headers():
+    h = {"Accept": "application/vnd.github+json", "User-Agent": "tp-monitor"}
+    if GH_TOKEN:
+        h["Authorization"] = f"Bearer {GH_TOKEN}"
+    return h
+
+def gh_get(url):
+    try:
+        r = requests.get(url, headers=gh_headers(), timeout=12)
+        return r.status_code, r.headers, (r.json() if r.status_code == 200 else None)
+    except Exception as e:
+        log(f"gh err: {e}")
+        return 0, {}, None
 
 def check_github(data):
     findings = []
-    seen     = set(data["seen_keys"])
-    hdrs     = {
-        "Accept":     "application/vnd.github.v3+json",
-        "User-Agent": "Mozilla/5.0"
-    }
+    seen = set(data["seen_keys"])
+    known_repos = data["github_repos"]
+    known_releases = data["github_releases"]
 
     for user in GITHUB_USERS:
-        try:
-            r = requests.get(
-                f"https://api.github.com/users/{user}/repos"
-                f"?per_page=100&sort=updated",
-                headers=hdrs, timeout=12
+        status, hdrs, repos = gh_get(f"https://api.github.com/users/{user}/repos?per_page=100&sort=updated")
+        if status == 404:
+            log(f"[GH] {user}: not found")
+            continue
+        if status == 403:
+            reset = hdrs.get("X-RateLimit-Reset", "?")
+            log(f"[GH] {user}: rate limited, reset {reset}")
+            continue
+        if status != 200:
+            log(f"[GH] {user}: status {status}")
+            continue
+
+        log(f"[GH] {user}: {len(repos)} repos")
+
+        for repo in repos:
+            full = repo['full_name']
+            key = f"gh:{full}"
+            updated = repo.get('updated_at', '')[:10]
+            desc = repo.get('description') or ''
+            prev = known_repos.get(full)
+
+            if key not in seen:
+                seen.add(key)
+                known_repos[full] = {"updated": updated, "desc": desc}
+                findings.append({
+                    "type": "github_repo",
+                    "user": user,
+                    "name": full,
+                    "url": repo['html_url'],
+                    "date": updated,
+                    "desc": desc,
+                })
+            elif prev and prev.get("updated") != updated:
+                known_repos[full] = {"updated": updated, "desc": desc}
+                findings.append({
+                    "type": "github_repo_update",
+                    "user": user,
+                    "name": full,
+                    "url": repo['html_url'],
+                    "old_date": prev.get("updated", "?"),
+                    "new_date": updated,
+                    "desc": desc,
+                })
+                seen.add(key)
+
+            # releases
+            rel_status, _, releases = gh_get(
+                f"https://api.github.com/repos/{full}/releases?per_page=5"
             )
-            if r.status_code == 200:
-                repos = r.json()
-                log(f"  [GH] {user}: {len(repos)} repos")
-                for repo in repos:
-                    key = f"gh:{repo['full_name']}"
-                    if key in seen:
+            if rel_status == 200 and releases:
+                for rel in releases:
+                    tag = rel['tag_name']
+                    rkey = f"ghrel:{full}:{tag}"
+                    pub = rel.get('published_at', '')[:10]
+                    if rkey in seen:
                         continue
-                    seen.add(key)
+                    seen.add(rkey)
+                    known_releases[rkey] = {"pub": pub}
+                    apks = [a for a in rel.get('assets', []) if a['name'].lower().endswith('.apk')]
                     findings.append({
-                        "type":   "github",
-                        "name":   repo['full_name'],
-                        "url":    repo['html_url'],
-                        "date":   repo.get('updated_at','')[:10],
-                        "user":   user
+                        "type": "github_release",
+                        "user": user,
+                        "repo": full,
+                        "tag": tag,
+                        "name": rel.get('name', tag),
+                        "body": (rel.get('body') or '')[:300],
+                        "date": pub,
+                        "apks": [{"name": a['name'], "url": a['browser_download_url'],
+                                  "size": a['size']} for a in apks],
                     })
+            time.sleep(0.5)
 
-                    # Releases bhi check karo
-                    try:
-                        rel = requests.get(
-                            f"https://api.github.com/repos/{repo['full_name']}/releases?per_page=5",
-                            headers=hdrs, timeout=10
-                        )
-                        if rel.status_code == 200:
-                            for release in rel.json():
-                                rkey = f"ghrel:{repo['full_name']}:{release['tag_name']}"
-                                if rkey in seen:
-                                    continue
-                                seen.add(rkey)
-                                # APK asset dhundho
-                                for asset in release.get('assets', []):
-                                    if asset['name'].endswith('.apk'):
-                                        findings.append({
-                                            "type":    "github_release",
-                                            "repo":    repo['full_name'],
-                                            "tag":     release['tag_name'],
-                                            "apk":     asset['browser_download_url'],
-                                            "size_mb": round(asset['size']/1024/1024, 1),
-                                            "date":    release.get('published_at','')[:10],
-                                            "user":    user
-                                        })
-                                        log(f"  [GH RELEASE] {repo['full_name']} {release['tag_name']}")
-                    except:
-                        pass
-                    time.sleep(0.3)
-
-            elif r.status_code == 404:
-                log(f"  [GH] {user}: not found")
-            else:
-                log(f"  [GH] {user}: {r.status_code}")
-        except Exception as e:
-            log(f"  GitHub err ({user}): {e}")
-        time.sleep(1)
-
+    # search
     for q in GITHUB_SEARCH:
-        try:
-            r = requests.get(
-                f"https://api.github.com/search/repositories"
-                f"?q={q}&sort=updated&per_page=10",
-                headers=hdrs, timeout=12
-            )
-            if r.status_code == 200:
-                for item in r.json().get('items', []):
-                    key = f"ghs:{item['full_name']}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    findings.append({
-                        "type": "github",
-                        "name": item['full_name'],
-                        "url":  item['html_url'],
-                        "date": item.get('updated_at','')[:10],
-                        "user": "search"
-                    })
-        except Exception as e:
-            log(f"  GH search err: {e}")
+        status, _, result = gh_get(
+            f"https://api.github.com/search/repositories?q={requests.utils.quote(q)}&sort=updated&per_page=10"
+        )
+        if status == 200 and result:
+            for item in result.get('items', []):
+                full = item['full_name']
+                key = f"ghs:{full}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append({
+                    "type": "github_search",
+                    "name": full,
+                    "url": item['html_url'],
+                    "date": item.get('updated_at', '')[:10],
+                    "query": q,
+                    "desc": item.get('description') or '',
+                })
         time.sleep(2)
 
-    data["seen_keys"] = list(seen)
+    data["seen_keys"] = prune_seen(list(seen))
+    data["github_repos"] = known_repos
+    data["github_releases"] = known_releases
     return findings
 
 # ===================================================
-# ALERT FORMAT
+# ALERT FORMATTING
 # ===================================================
 
+def fmt_apks(apks):
+    if not apks:
+        return "  (no APK asset)"
+    lines = []
+    for a in apks:
+        lines.append(f"  📦 {a['name']} ({human_size(a['size'])})\n     {a['url']}")
+    return "\n".join(lines)
+
 def alert(f):
-    t  = f['type']
-    ts = datetime.now().strftime('%d %b %H:%M')
+    t = f['type']
+    ts = now_str()
 
     if t == "cf_update":
         return (
-            f"🔄 <b>VERSION UPDATE!</b>\n"
+            f"🔄 <b>VERSION UPDATE</b>\n"
             f"📱 <b>{f['app']}</b>\n"
-            f"📊 v{f['old']} → <b>v{f['new']}</b>\n"
+            f"📊 v{f['old_ver']} → <b>v{f['new_ver']}</b>\n"
             f"🌐 {f['domain']}\n"
+            f"💾 {human_size(f['size'])}\n"
+            f"🕐 {f['lm'] or 'unknown'}\n"
             f"🔗 <code>{f['url']}</code>\n"
-            f"💾 {f['mb']} MB | ⏰ {ts}"
+            f"⏰ {ts}"
         )
-    elif t == "cf_new":
+    if t == "cf_rehash":
         return (
-            f"🆕 <b>NAYA APP CLOUDFRONT PE!</b>\n"
+            f"♻️ <b>APK CHANGED (same version)</b>\n"
             f"📱 <b>{f['app']}</b> v{f['ver']}\n"
+            f"📝 {'; '.join(f['reasons'])}\n"
+            f"💾 {human_size(f['size'])}\n"
             f"🔗 <code>{f['url']}</code>\n"
-            f"💾 {f['mb']} MB | ⏰ {ts}"
+            f"⏰ {ts}"
         )
-    elif t == "cf_found":
+    if t == "domain_apk":
         return (
-            f"📦 <b>APK CONFIRMED</b>\n"
-            f"📱 <b>{f['app']}</b> v{f['ver']}\n"
-            f"🔗 <code>{f['url']}</code>\n"
-            f"💾 {f['mb']} MB"
-        )
-    elif t == "domain_apk":
-        return (
-            f"🌐 <b>DOMAIN APK!</b>\n"
+            f"🌐 <b>DOMAIN APK</b>\n"
             f"📱 <b>{f['app']}</b>\n"
             f"🌐 {f['domain']}\n"
-            f"🔗 <code>{f['url']}</code>"
+            f"🔗 <code>{f['url']}</code>\n"
+            f"⏰ {ts}"
         )
-    elif t == "ssl":
+    if t == "ssl":
         return (
-            f"🔐 <b>NAYA DOMAIN/SSL!</b>\n"
+            f"🔐 <b>NEW SSL CERT</b>\n"
             f"🌐 <code>{f['domain']}</code>\n"
-            f"📅 {f['date']} | 🔍 {f['kw']}\n"
-            f"➡️ https://{f['domain']}"
+            f"📅 {f['date']}\n"
+            f"🔍 keyword: {f['kw']}\n"
+            f"➡️ https://{f['domain']}\n"
+            f"⏰ {ts}"
         )
-    elif t == "github":
+    if t == "github_repo":
         return (
-            f"🐙 <b>GITHUB REPO!</b>\n"
-            f"👤 Account: <b>{f['user']}</b>\n"
-            f"📁 {f['name']}\n"
+            f"🐙 <b>NEW GITHUB REPO</b>\n"
+            f"👤 {f['user']}\n"
+            f"📁 <b>{f['name']}</b>\n"
+            f"📝 {f['desc'] or '(no description)'}\n"
             f"🔗 {f['url']}\n"
-            f"📅 {f['date']}"
+            f"📅 {f['date']}\n"
+            f"⏰ {ts}"
         )
-    elif t == "github_release":
+    if t == "github_repo_update":
         return (
-            f"🚀 <b>GITHUB RELEASE / NEW APK!</b>\n"
-            f"👤 Account: <b>{f['user']}</b>\n"
-            f"📁 {f['repo']}\n"
-            f"🏷️ Tag: <b>{f['tag']}</b>\n"
-            f"🔗 <code>{f['apk']}</code>\n"
-            f"💾 {f['size_mb']} MB | 📅 {f['date']}"
+            f"🐙 <b>GITHUB REPO UPDATED</b>\n"
+            f"👤 {f['user']}\n"
+            f"📁 <b>{f['name']}</b>\n"
+            f"📅 {f['old_date']} → <b>{f['new_date']}</b>\n"
+            f"📝 {f['desc'] or ''}\n"
+            f"🔗 {f['url']}\n"
+            f"⏰ {ts}"
         )
-    return str(f)
+    if t == "github_release":
+        body = f"\n📄 {f['body']}" if f['body'] else ""
+        return (
+            f"🚀 <b>NEW RELEASE / APK</b>\n"
+            f"👤 {f['user']}\n"
+            f"📁 <b>{f['repo']}</b>\n"
+            f"🏷️ Tag: <b>{f['tag']}</b>\n"
+            f"📅 {f['date']}{body}\n"
+            f"{fmt_apks(f['apks'])}\n"
+            f"⏰ {ts}"
+        )
+    if t == "github_search":
+        return (
+            f"🔎 <b>GITHUB SEARCH HIT</b>\n"
+            f"🔍 query: <code>{f['query']}</code>\n"
+            f"📁 <b>{f['name']}</b>\n"
+            f"📝 {f['desc'] or ''}\n"
+            f"🔗 {f['url']}\n"
+            f"📅 {f['date']}\n"
+            f"⏰ {ts}"
+        )
+    return f"❓ unknown: {f}"
 
 # ===================================================
 # MAIN
@@ -437,91 +545,134 @@ def alert(f):
 def run(data):
     all_f = []
     log("CloudFront check...")
-    all_f.extend(check_cloudfront(data))
+    cf = check_cloudfront(data)
+    log(f"  cf findings: {len(cf)}")
+    all_f.extend(cf)
+
     log("Domain check...")
-    all_f.extend(check_domains(data))
+    dm = check_domains(data)
+    log(f"  domain findings: {len(dm)}")
+    all_f.extend(dm)
+
     log("SSL check...")
-    all_f.extend(check_ssl(data))
+    sl = check_ssl(data)
+    log(f"  ssl findings: {len(sl)}")
+    all_f.extend(sl)
+
     log("GitHub check...")
-    all_f.extend(check_github(data))
+    gh = check_github(data)
+    log(f"  github findings: {len(gh)}")
+    all_f.extend(gh)
+
     return all_f
 
-def main():
-    log("=" * 40)
-    log("TailPay Monitor v4 START")
-    log(f"BOT_TOKEN: {'SET (' + str(len(BOT_TOKEN)) + ' chars)' if BOT_TOKEN else 'MISSING!'}")
-    log(f"CHAT_ID:   {'SET' if CHAT_ID else 'MISSING!'}")
-    log(f"GitHub accounts: {len(GITHUB_USERS)}")
-    log("=" * 40)
+def heartbeat(data, scan_count, findings_count, started_at):
+    uptime = str(datetime.now(timezone.utc) - started_at).split('.')[0]
+    versions = data.get("app_versions", {})
+    total_apps = len(versions)
+    last = data.get("last_scan", "?")
+    if findings_count == 0:
+        return (
+            f"💤 <b>Heartbeat — koi update nahi</b>\n"
+            f"⏰ {now_str()}\n"
+            f"🔁 Scan #{scan_count} | Uptime: {uptime}\n"
+            f"📱 Tracked apps: {total_apps}\n"
+            f"🔍 Last new finding: {last}\n"
+            f"✅ Sab sources check kiye — kuch naya nahi mila."
+        )
+    return None
 
-    send(
-        "🟢 <b>TailPay Monitor v4 ON</b>\n\n"
-        f"📱 {len(APP_MAP)} apps track ho rahe hain\n"
-        "🔄 CloudFront version updates\n"
-        "🆕 Naye CloudFront apps\n"
-        "🔐 SSL certificates\n"
-        f"🐙 GitHub: {len(GITHUB_USERS)} accounts monitor\n"
-        "  ├ tailshaofu005-cmd\n"
-        "  ├ tailpaytech\n"
-        "  ├ 649152551\n"
-        "  ├ jqkxcdgpkh\n"
-        "  ├ 286375632\n"
-        "  └ boxcking\n\n"
-        f"⏰ Har {INTERVAL//60} min check hoga!\n"
-        "Koi bhi release/update — seedha alert!"
+def startup_message(data):
+    versions = data.get("app_versions", {})
+    return (
+        "🟢 <b>TailPay Monitor v5 ON</b>\n\n"
+        f"📱 {len(APP_MAP)} apps tracked\n"
+        f"🔄 CloudFront version + hash changes\n"
+        f"🌐 Domain APK check\n"
+        f"🔐 SSL certs\n"
+        f"🐙 GitHub: {len(GITHUB_USERS)} accounts + {len(GITHUB_SEARCH)} search queries\n"
+        f"💓 Heartbeat every {INTERVAL//60} min\n"
+        f"📊 Baseline versions cached: {len(versions)}\n\n"
+        f"Pehla scan chal raha hai..."
     )
+
+def main():
+    log("=" * 50)
+    log("TailPay Monitor v5 START")
+    log(f"BOT_TOKEN: {'SET' if BOT_TOKEN else 'MISSING'}")
+    log(f"CHAT_ID:   {'SET' if CHAT_ID else 'MISSING'}")
+    log(f"GH_TOKEN:  {'SET' if GH_TOKEN else 'not set (rate limit 60/h)'}")
+    log(f"SAVE_FILE: {SAVE_FILE}")
+    log("=" * 50)
 
     data = load_data()
+    first_run = not data.get("first_run_done", False)
 
-    log("Pehla scan shuru...")
-    findings = run(data)
-    save_data(data)
+    send(startup_message(data))
 
-    cf_found  = [f for f in findings if f['type'] == 'cf_found']
-    updates   = [f for f in findings if f['type'] == 'cf_update']
-    new_apps  = [f for f in findings if f['type'] == 'cf_new']
-    gh_repos  = [f for f in findings if f['type'] == 'github']
-    gh_rel    = [f for f in findings if f['type'] == 'github_release']
-    ssl_certs = [f for f in findings if f['type'] == 'ssl']
+    started_at = datetime.now(timezone.utc)
+    scan_count = 0
 
-    summary = (
-        f"📊 <b>Pehla scan complete!</b>\n\n"
-        f"📦 Existing APKs confirmed: {len(cf_found)}\n"
-        f"🔄 Version updates: {len(updates)}\n"
-        f"🆕 Naye apps: {len(new_apps)}\n"
-        f"🐙 GitHub repos: {len(gh_repos)}\n"
-        f"🚀 GitHub releases: {len(gh_rel)}\n"
-        f"🔐 SSL certs: {len(ssl_certs)}\n\n"
-        f"Ab monitoring shuru — alert aayega jab kuch naya mile!"
-    )
-    send(summary)
-
-    # Sirf important alerts bhejo — cf_found skip karo (bahut zyada hogi)
-    important = [f for f in findings if f['type'] in
-                 ['cf_update','cf_new','github','github_release','ssl','domain_apk']]
-    if important:
-        send(f"⚡ <b>{len(important)} important findings:</b>")
-        for f in important:
-            send(alert(f))
-            time.sleep(0.5)
-
-    while True:
-        log(f"Next check {INTERVAL//60} min mein...")
-        time.sleep(INTERVAL)
-        log("Checking all sources...")
+    # First run: silent baseline, just report counts
+    if first_run:
+        log("First run: building baseline silently...")
         findings = run(data)
+        data["first_run_done"] = True
+        data["last_scan"] = now_str()
         save_data(data)
+
+        cf_found = [f for f in findings if f['type'] == 'cf_update']
+        gh_repo = [f for f in findings if f['type'] == 'github_repo']
+        gh_rel = [f for f in findings if f['type'] == 'github_release']
+        ssl_c = [f for f in findings if f['type'] == 'ssl']
+        summary = (
+            f"📊 <b>Baseline complete</b>\n\n"
+            f"📦 CloudFront updates cached: {len(cf_found)}\n"
+            f"🐙 GitHub repos: {len(gh_repo)}\n"
+            f"🚀 GitHub releases: {len(gh_rel)}\n"
+            f"🔐 SSL certs: {len(ssl_c)}\n\n"
+            f"Ab monitoring active. Har {INTERVAL//60} min scan hoga."
+        )
+        send(summary)
+    else:
+        log("Resuming from saved state.")
+
+    # Main loop
+    while True:
+        log(f"sleeping {INTERVAL//60} min...")
+        time.sleep(INTERVAL)
+        scan_count += 1
+        log(f"=== scan #{scan_count} ===")
+
+        try:
+            findings = run(data)
+        except Exception as e:
+            log(f"scan err: {e}")
+            send(f"⚠️ Scan error: <code>{e}</code>")
+            continue
+
+        data["last_scan"] = now_str()
         if findings:
+            data["last_finding"] = now_str()
+        save_data(data)
+
+        if findings:
+            log(f"findings: {len(findings)}")
+            send(f"⚡ <b>{len(findings)} new finding(s)</b> — scan #{scan_count}")
             for f in findings:
-                send(alert(f))
-                log(f"Alert sent: {f['type']}")
+                try:
+                    send(alert(f))
+                except Exception as e:
+                    log(f"alert err: {e}")
                 time.sleep(0.5)
         else:
-            log("Kuch naya nahi mila")
+            hb = heartbeat(data, scan_count, 0, started_at)
+            if hb:
+                send(hb)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log("Band kiya.")
-        send("🔴 Monitor band ho gaya.")
+        log("Stopped.")
+        send("🔴 Monitor v5 stopped.")
